@@ -70,6 +70,17 @@ async def combined_lifespan(oauth_app, header_app, sse_app):
                 yield
 
 
+def oauth_http_enabled() -> bool:
+    """Return True when the env needed for Plane OAuth HTTP mode is configured."""
+    return all(
+        (
+            os.getenv("PLANE_OAUTH_PROVIDER_CLIENT_ID"),
+            os.getenv("PLANE_OAUTH_PROVIDER_CLIENT_SECRET"),
+            os.getenv("PLANE_OAUTH_PROVIDER_BASE_URL"),
+        )
+    )
+
+
 def main() -> None:
     """Run the MCP server."""
     server_mode = ServerMode.STDIO
@@ -87,27 +98,35 @@ def main() -> None:
         return
 
     if server_mode == ServerMode.HTTP:
-        oauth_mcp = get_oauth_mcp("/http")
-        oauth_app = oauth_mcp.http_app(stateless_http=True)
         header_app = get_header_mcp().http_app(stateless_http=True)
+        routes = [Mount("/http/api-key", app=header_app)]
+        lifespan = header_app.lifespan
 
-        sse_mcp = get_oauth_mcp()
-        sse_app = sse_mcp.http_app(transport="sse")
+        if oauth_http_enabled():
+            oauth_mcp = get_oauth_mcp("/http")
+            oauth_app = oauth_mcp.http_app(stateless_http=True)
 
-        oauth_well_known = oauth_mcp.auth.get_well_known_routes(mcp_path="/mcp")
-        sse_well_known = sse_mcp.auth.get_well_known_routes(mcp_path="/sse")
+            sse_mcp = get_oauth_mcp()
+            sse_app = sse_mcp.http_app(transport="sse")
 
-        app = Starlette(
-            routes=[
-                # Well-known routes for OAuth and Header HTTP
+            oauth_well_known = oauth_mcp.auth.get_well_known_routes(mcp_path="/mcp")
+            sse_well_known = sse_mcp.auth.get_well_known_routes(mcp_path="/sse")
+
+            routes = [
+                *routes,
                 *oauth_well_known,
                 *sse_well_known,
-                # Mount both MCP servers
-                Mount("/http/api-key", app=header_app),
                 Mount("/http", app=oauth_app),
                 Mount("/", app=sse_app),
-            ],
-            lifespan=lambda app: combined_lifespan(oauth_app, header_app, sse_app),
+            ]
+            lifespan = lambda app: combined_lifespan(oauth_app, header_app, sse_app)
+            logger.info("Starting HTTP server with API-key and OAuth transports")
+        else:
+            logger.info("Starting HTTP server in API-key-only mode at /http/api-key/mcp")
+
+        app = Starlette(
+            routes=routes,
+            lifespan=lifespan,
         )
 
         app.add_middleware(
@@ -127,11 +146,10 @@ def main() -> None:
             uv_handler.setFormatter(JSONFormatter())
             uv_logger.addHandler(uv_handler)
 
-        logger.info("Starting HTTP server at URLs: /mcp and /header/mcp")
         uvicorn.run(
             app,
-            host="0.0.0.0",
-            port=8211,
+            host=os.getenv("PLANE_MCP_HOST", "0.0.0.0"),
+            port=int(os.getenv("PLANE_MCP_PORT", "8211")),
             log_level="info",
             access_log=False,
         )
