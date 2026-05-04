@@ -4,7 +4,7 @@ from typing import Any, get_args
 
 from fastmcp import FastMCP
 from plane.models.enums import PriorityEnum
-from plane.models.query_params import RetrieveQueryParams, WorkItemQueryParams
+from plane.models.query_params import PaginatedQueryParams, RetrieveQueryParams, WorkItemQueryParams
 from plane.models.work_items import (
     AdvancedSearchResult,
     AdvancedSearchWorkItem,
@@ -61,6 +61,145 @@ def _build_advanced_search_filters(
     return {"and": conditions}
 
 
+def _can_filter_work_items_locally(
+    *,
+    assignee_ids: list[str] | None,
+    label_ids: list[str] | None,
+    type_ids: list[str] | None,
+    cycle_ids: list[str] | None,
+    module_ids: list[str] | None,
+    workspace_search: bool,
+) -> bool:
+    """Use normal list endpoints for filters the MCP server can safely emulate."""
+    return bool(
+        not assignee_ids
+        and not label_ids
+        and not type_ids
+        and not cycle_ids
+        and not module_ids
+    )
+
+
+def _state_id(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        state_id = value.get("id")
+        return state_id if isinstance(state_id, str) else None
+    return getattr(value, "id", None)
+
+
+def _matches_work_item_query(item: WorkItem, query: str | None) -> bool:
+    if not query:
+        return True
+
+    needle = query.strip().lower()
+    if not needle:
+        return True
+
+    haystack = " ".join(
+        str(value or "").lower()
+        for value in (
+            getattr(item, "name", None),
+            getattr(item, "description_stripped", None),
+            getattr(item, "description_html", None),
+            getattr(item, "external_id", None),
+        )
+    )
+    return needle in haystack
+
+
+def _list_project_work_items(
+    *,
+    client: Any,
+    workspace_slug: str,
+    project_id: str,
+    cursor: str | None,
+    expand: str | None,
+    fields: str | None,
+    order_by: str | None,
+    external_id: str | None,
+    external_source: str | None,
+) -> list[WorkItem]:
+    all_items: list[WorkItem] = []
+    next_cursor = cursor
+    while True:
+        params = WorkItemQueryParams(
+            cursor=next_cursor,
+            per_page=100,
+            expand=expand,
+            fields=fields,
+            order_by=order_by,
+            external_id=external_id,
+            external_source=external_source,
+        )
+        response: PaginatedWorkItemResponse = client.work_items.list(
+            workspace_slug=workspace_slug,
+            project_id=project_id,
+            params=params,
+        )
+        if not response.results:
+            break
+        all_items.extend(response.results)
+        if not response.next_page_results:
+            break
+        next_cursor = response.next_cursor
+        if not next_cursor:
+            break
+    return all_items
+
+
+def _list_workspace_project_ids(*, client: Any, workspace_slug: str) -> list[str]:
+    project_ids: list[str] = []
+    next_cursor: str | None = None
+    while True:
+        params = PaginatedQueryParams(cursor=next_cursor, per_page=100)
+        response = client.projects.list(workspace_slug=workspace_slug, params=params)
+        for project in response.results:
+            project_id = getattr(project, "id", None)
+            if project_id:
+                project_ids.append(project_id)
+        if not response.next_page_results:
+            break
+        next_cursor = response.next_cursor
+        if not next_cursor:
+            break
+    return project_ids
+
+
+def _filter_project_work_items_locally(
+    items: list[WorkItem],
+    *,
+    query: str | None,
+    state_ids: list[str] | None,
+    state_groups: list[str] | None,
+    state_groups_by_id: dict[str, str],
+    priorities: list[str] | None,
+    is_archived: bool | None,
+    created_by_ids: list[str] | None,
+    limit: int | None,
+) -> list[WorkItem]:
+    filtered: list[WorkItem] = []
+    for item in items:
+        if not _matches_work_item_query(item, query):
+            continue
+        item_state_id = _state_id(getattr(item, "state", None))
+        if state_ids and item_state_id not in state_ids:
+            continue
+        if state_groups and state_groups_by_id.get(item_state_id or "") not in state_groups:
+            continue
+        if priorities and getattr(item, "priority", None) not in priorities:
+            continue
+        if is_archived is not None and bool(getattr(item, "archived_at", None)) != is_archived:
+            continue
+        if created_by_ids and getattr(item, "created_by", None) not in created_by_ids:
+            continue
+        filtered.append(item)
+        if limit is not None and len(filtered) >= limit:
+            break
+    return filtered
+
+
 def register_work_item_tools(mcp: FastMCP) -> None:
     """Register all work item-related tools with the MCP server."""
 
@@ -91,10 +230,10 @@ def register_work_item_tools(mcp: FastMCP) -> None:
         """
         List work items in a project or search across the workspace.
 
-        When any filter parameter is provided (assignee_ids, state_ids, state_groups,
-        priorities, label_ids, type_ids, cycle_ids, module_ids, is_archived,
-        created_by_ids, or query), this uses the advanced search endpoint which
-        supports powerful filtering. Otherwise it uses the standard list endpoint.
+        Query, state, priority, archived, and creator filters use normal list
+        endpoints with local filtering so API-key/service-account clients do not
+        need Plane's privileged advanced-search API. Unsupported filters still use
+        advanced search.
 
         Args:
             project_id: UUID of the project. Required when no filters are provided.
@@ -141,6 +280,57 @@ def register_work_item_tools(mcp: FastMCP) -> None:
             is_archived=is_archived,
             created_by_ids=created_by_ids,
         )
+
+        if (filters is not None or query is not None) and _can_filter_work_items_locally(
+            assignee_ids=assignee_ids,
+            label_ids=label_ids,
+            type_ids=type_ids,
+            cycle_ids=cycle_ids,
+            module_ids=module_ids,
+            workspace_search=workspace_search,
+        ):
+            project_ids = [project_id] if project_id else _list_workspace_project_ids(
+                client=client,
+                workspace_slug=workspace_slug,
+            )
+            filtered_items: list[WorkItem] = []
+            for current_project_id in project_ids:
+                state_groups_by_id: dict[str, str] = {}
+                if state_groups:
+                    states_response = client.states.list(
+                        workspace_slug=workspace_slug,
+                        project_id=current_project_id,
+                    )
+                    state_groups_by_id = {state.id: state.group for state in states_response.results}
+
+                all_items = _list_project_work_items(
+                    client=client,
+                    workspace_slug=workspace_slug,
+                    project_id=current_project_id,
+                    cursor=cursor if project_id else None,
+                    expand=expand,
+                    fields=fields,
+                    order_by=order_by,
+                    external_id=external_id,
+                    external_source=external_source,
+                )
+                filtered_items.extend(
+                    _filter_project_work_items_locally(
+                        all_items,
+                        query=query,
+                        state_ids=state_ids,
+                        state_groups=state_groups,
+                        state_groups_by_id=state_groups_by_id,
+                        priorities=priorities,
+                        is_archived=is_archived,
+                        created_by_ids=created_by_ids,
+                        limit=None,
+                    )
+                )
+                if limit is not None and len(filtered_items) >= limit:
+                    return filtered_items[:limit]
+
+            return filtered_items[:limit] if limit is not None else filtered_items
 
         if filters is not None or query is not None:
             data = AdvancedSearchWorkItem(
